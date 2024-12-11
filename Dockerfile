@@ -1,5 +1,5 @@
 # Stage 1: Build the Go application
-FROM golang:1.20 AS builder
+FROM golang:1.22 AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -26,7 +26,7 @@ RUN apk add --no-cache ca-certificates
 WORKDIR /app
 
 # Copy the compiled binary from the build stage
-COPY --from=builder /app/myapp .
+COPY --from=builder /app/controller .
 
 
 # Run the application
