@@ -5,14 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -41,32 +43,37 @@ func main() {
 		}
 	}
 
-	// Create the Kubernetes client
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
+  // Create the Kubernetes client
+  clientset, err := kubernetes.NewForConfig(config)
+  if err != nil {
+	  panic(err.Error())
+  }
 
-	// Start watching pods
-	fmt.Println("Starting Pod Reaper controller...")
+  // Start watching pods
+  fmt.Println("Starting Pod Reaper controller...")
 
-	// Create a context with a timeout
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
-	defer cancel()
+  // Create a context that can be canceled
+  ctx, cancel := context.WithCancel(context.Background())
+  defer cancel()
 
-	err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 1*time.Hour, true, func(context.Context) (done bool, err error) {
-		err = remediatePods(clientset)
-		if err != nil {
-			fmt.Printf("Error during remediation: %v\n", err)
-			// Log the error but continue polling
-			return false, nil
-		}
-		// Continue polling indefinitely
-		return false, nil
-	})
-	if err != nil {
-		panic(fmt.Sprintf("Polling stopped due to: %v", err))
-	}
+  // Set up signal handling for graceful shutdown
+  sigterm := make(chan os.Signal, 1)
+  signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
+
+  go func() {
+	  <-sigterm
+	  fmt.Println("Received SIGTERM, shutting down gracefully...")
+	  cancel()
+  }()
+
+  wait.UntilWithContext(ctx, func(ctx context.Context) {
+	  err = remediatePods(clientset)
+	  if err != nil {
+		  fmt.Printf("Error during remediation: %v\n", err)
+	  }
+  }, 10*time.Second)
+
+  fmt.Println("Polling stopped due to context cancellation.")
 }
 
 func remediatePods(clientset *kubernetes.Clientset) error {
