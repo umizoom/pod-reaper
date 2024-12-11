@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"flag"
-	"time"
+	"fmt"
 	"os"
+	"time"
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -16,7 +16,6 @@ import (
 )
 
 func main() {
-	
 	// Read environment variable for inCluster
 	inCluster := os.Getenv("inCluster") == "true"
 
@@ -54,8 +53,10 @@ func main() {
 		err := remediatePods(clientset)
 		if err != nil {
 			fmt.Printf("Error during remediation: %v\n", err)
-			return false, nil // Retry on error
+			// Log error but continue polling
+			return false, nil
 		}
+		// Always return false to keep polling indefinitely
 		return false, nil
 	})
 	if err != nil {
