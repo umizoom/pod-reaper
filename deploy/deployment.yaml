@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-controller
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-controller
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: custom-controller
+    spec:
+      serviceAccountName: custom-controller-sa
+      containers:
+        - env:
+            - name: inCluster
+              value: "true"
+          image: ghcr.io/umizoom/pod-reaper:latest@sha256:261e713b81a096d341ad2f86b0d04c156318c6e571e930378eec676d88aad403
+          name: custom-controller
+      restartPolicy: Always
+
