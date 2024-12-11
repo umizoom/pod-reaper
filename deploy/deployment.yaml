@@ -20,7 +20,7 @@ spec:
         - env:
             - name: inCluster
               value: "true"
-          image: ghcr.io/umizoom/pod-reaper:latest@sha256:261e713b81a096d341ad2f86b0d04c156318c6e571e930378eec676d88aad403
+          image: ghcr.io/umizoom/pod-reaper:latest
           name: custom-controller
       restartPolicy: Always
 

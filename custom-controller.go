@@ -5,6 +5,8 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	v1 "k8s.io/api/core/v1"
@@ -41,27 +43,37 @@ func main() {
 		}
 	}
 
-	// Create the Kubernetes client
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err.Error())
-	}
+  // Create the Kubernetes client
+  clientset, err := kubernetes.NewForConfig(config)
+  if err != nil {
+	  panic(err.Error())
+  }
 
-	// Start watching pods
-	fmt.Println("Starting Pod Reaper controller...")
-	err = wait.PollImmediate(10*time.Second, time.Hour, func() (bool, error) {
-		err := remediatePods(clientset)
-		if err != nil {
-			fmt.Printf("Error during remediation: %v\n", err)
-			// Log error but continue polling
-			return false, nil
-		}
-		// Always return false to keep polling indefinitely
-		return false, nil
-	})
-	if err != nil {
-		panic(err.Error())
-	}
+  // Start watching pods
+  fmt.Println("Starting Pod Reaper controller...")
+
+  // Create a context that can be canceled
+  ctx, cancel := context.WithCancel(context.Background())
+  defer cancel()
+
+  // Set up signal handling for graceful shutdown
+  sigterm := make(chan os.Signal, 1)
+  signal.Notify(sigterm, syscall.SIGTERM, syscall.SIGINT)
+
+  go func() {
+	  <-sigterm
+	  fmt.Println("Received SIGTERM, shutting down gracefully...")
+	  cancel()
+  }()
+
+  wait.UntilWithContext(ctx, func(ctx context.Context) {
+	  err = remediatePods(clientset)
+	  if err != nil {
+		  fmt.Printf("Error during remediation: %v\n", err)
+	  }
+  }, 10*time.Second)
+
+  fmt.Println("Polling stopped due to context cancellation.")
 }
 
 func remediatePods(clientset *kubernetes.Clientset) error {
