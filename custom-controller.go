@@ -9,10 +9,10 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"k8s.io/apimachinery/pkg/util/wait"
 )
 
 func main() {
@@ -49,18 +49,23 @@ func main() {
 
 	// Start watching pods
 	fmt.Println("Starting Pod Reaper controller...")
-	err = wait.PollImmediate(10*time.Second, time.Hour, func() (bool, error) {
-		err := remediatePods(clientset)
+
+	// Create a context with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Hour)
+	defer cancel()
+
+	err = wait.PollUntilContextTimeout(ctx, 10*time.Second, 1*time.Hour, true, func(context.Context) (done bool, err error) {
+		err = remediatePods(clientset)
 		if err != nil {
 			fmt.Printf("Error during remediation: %v\n", err)
-			// Log error but continue polling
+			// Log the error but continue polling
 			return false, nil
 		}
-		// Always return false to keep polling indefinitely
+		// Continue polling indefinitely
 		return false, nil
 	})
 	if err != nil {
-		panic(err.Error())
+		panic(fmt.Sprintf("Polling stopped due to: %v", err))
 	}
 }
 
