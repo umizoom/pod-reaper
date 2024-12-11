@@ -17,16 +17,16 @@ COPY . .
 RUN go build -o controller .
 
 # Stage 2: Create a minimal runtime image
-FROM alpine:3.18
+# FROM alpine:3.18
 
 # Install required certificates
-RUN apk add --no-cache ca-certificates
+# RUN apk add --no-cache ca-certificates
 
 # Set the working directory
-WORKDIR /app
+# WORKDIR /app
 
 # Copy the compiled binary from the build stage
-COPY --from=builder /app/controller .
+# COPY --from=builder /app/controller .
 
 
 # Run the application
