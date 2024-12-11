@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: custom-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: custom-controller
+  template:
+    metadata:
+      labels:
+        app: custom-controller
+    spec:
+      serviceAccountName: custom-controller-sa
+      containers:
+        - name: custom-controller
+          image: your-registry/custom-controller:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/custom-controller"]

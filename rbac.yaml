@@ -1,0 +1,24 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  namespace: kube-system
+  name: custom-controller-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  namespace: kube-system
+  name: custom-controller-binding
+subjects:
+  - kind: ServiceAccount
+    name: custom-controller-sa
+    namespace: kube-system
+roleRef:
+  kind: Role
+  name: custom-controller-role
+  apiGroup: rbac.authorization.k8s.io
