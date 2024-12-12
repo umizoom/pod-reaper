@@ -21,18 +21,29 @@ func main() {
 	// Read environment variable for inCluster
 	inCluster := os.Getenv("inCluster") == "true"
 
+	// Configure timezone for timestamps
+	timezone := os.Getenv("TIMEZONE")
+	if timezone == "" {
+		timezone = "UTC"
+	}
+	loc, timeErr := time.LoadLocation(timezone)
+
+	if timeErr != nil {
+		panic(fmt.Sprintf("Invalid timezone: %v", timeErr))
+		}
+
 	// Configure Kubernetes client
 	var config *rest.Config
 	var err error
 
 	if inCluster {
-		fmt.Println("Using in-cluster configuration.")
+		log("Using in-cluster configuration.", loc)
 		config, err = rest.InClusterConfig()
 		if err != nil {
 			panic(fmt.Sprintf("Failed to load in-cluster config: %v", err))
 		}
 	} else {
-		fmt.Println("Using out-of-cluster configuration.")
+		log("Using out-of-cluster configuration.", loc)
 		// Define a kubeconfig flag
 		kubeconfig := flag.String("kubeconfig", "~/.kube/config", "Path to kubeconfig file")
 		flag.Parse()
@@ -50,7 +61,7 @@ func main() {
   }
 
   // Start watching pods
-  fmt.Println("Starting Pod Reaper controller...")
+  log("Starting Pod Reaper controller...", loc)
 
   // Create a context that can be canceled
   ctx, cancel := context.WithCancel(context.Background())
@@ -62,21 +73,21 @@ func main() {
 
   go func() {
 	  <-sigterm
-	  fmt.Println("Received SIGTERM, shutting down gracefully...")
+	  log("Received SIGTERM, shutting down gracefully...", loc)
 	  cancel()
   }()
 
   wait.UntilWithContext(ctx, func(ctx context.Context) {
-	  err = remediatePods(clientset)
+	  err = remediatePods(clientset, loc)
 	  if err != nil {
-		  fmt.Printf("Error during remediation: %v\n", err)
+		log(fmt.Sprintf("Error during remediation: %v", err), loc)
 	  }
   }, 10*time.Second)
 
-  fmt.Println("Polling stopped due to context cancellation.")
+  log("Polling stopped due to context cancellation.", loc)
 }
 
-func remediatePods(clientset *kubernetes.Clientset) error {
+func remediatePods(clientset *kubernetes.Clientset, loc *time.Location) error {
 	podList, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		return err
@@ -84,12 +95,12 @@ func remediatePods(clientset *kubernetes.Clientset) error {
 
 	for _, pod := range podList.Items {
 		if shouldRemediate(pod) {
-			fmt.Printf("Remediating pod %s in namespace %s...\n", pod.Name, pod.Namespace)
+			log(fmt.Sprintf("Remediating pod %s in namespace %s...", pod.Name, pod.Namespace), loc)
 			err := clientset.CoreV1().Pods(pod.Namespace).Delete(context.TODO(), pod.Name, metav1.DeleteOptions{})
 			if err != nil {
-				fmt.Printf("Failed to delete pod %s: %v\n", pod.Name, err)
+				log(fmt.Sprintf("Failed to delete pod %s: %v", pod.Name, err), loc)
 			} else {
-				fmt.Printf("Pod %s deleted successfully.\n", pod.Name)
+				log(fmt.Sprintf("Pod %s deleted successfully.", pod.Name), loc)
 			}
 		}
 	}
@@ -108,4 +119,9 @@ func shouldRemediate(pod v1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func log(message string, loc *time.Location) {
+	timestamp := time.Now().In(loc).Format("2006-01-02 15:04:05 MST")
+	fmt.Printf("[%s] %s\n", timestamp, message)
 }
