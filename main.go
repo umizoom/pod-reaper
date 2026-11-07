@@ -70,7 +70,7 @@ func run(cfg Config, kubeconfig string, logger *slog.Logger) error {
 	}
 
 	if cfg.WebhookURL != "" {
-		n, err := newWebhookNotifier(cfg.WebhookURL)
+		n, err := newWebhookNotifier(cfg.WebhookURL, cfg.Location)
 		if err != nil {
 			return err
 		}
