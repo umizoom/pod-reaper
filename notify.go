@@ -14,36 +14,74 @@ import (
 	"unicode/utf8"
 )
 
-// Notifier delivers a human-readable message somewhere outside the cluster.
+// Notifier delivers alerts somewhere outside the cluster.
 type Notifier interface {
-	Notify(ctx context.Context, msg string) error
+	Notify(ctx context.Context, alerts []Alert) error
 }
 
-// maxMessageLen is Discord's content limit; Slack allows more.
-const maxMessageLen = 2000
+const (
+	maxSlackText       = 3000 // Slack section text limit
+	maxEmbedsPerPost   = 10   // Discord limit per message
+	flavourDiscord     = "discord"
+	flavourSlack       = "slack"
+	webhookHTTPTimeout = 10 * time.Second
+)
 
-// webhookNotifier posts JSON to a Discord or Slack incoming webhook.
+// webhookNotifier posts to a Discord (embeds) or Slack (mrkdwn text) webhook.
 // The URL embeds a credential, so it is never included in errors or logs.
 type webhookNotifier struct {
-	url    string
-	field  string // "content" (Discord) or "text" (Slack)
-	client *http.Client
+	url     string
+	flavour string
+	loc     *time.Location
+	client  *http.Client
 }
 
-func newWebhookNotifier(rawURL string) (*webhookNotifier, error) {
+func newWebhookNotifier(rawURL string, loc *time.Location) (*webhookNotifier, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return nil, errors.New("invalid WEBHOOK_URL: must be an http(s) URL")
 	}
-	field := "content"
+	flavour := flavourDiscord
 	if host := u.Hostname(); host == "hooks.slack.com" || strings.HasSuffix(host, ".slack.com") {
-		field = "text"
+		flavour = flavourSlack
 	}
-	return &webhookNotifier{url: rawURL, field: field, client: &http.Client{Timeout: 10 * time.Second}}, nil
+	if loc == nil {
+		loc = time.UTC
+	}
+	return &webhookNotifier{url: rawURL, flavour: flavour, loc: loc, client: &http.Client{Timeout: webhookHTTPTimeout}}, nil
 }
 
-func (w *webhookNotifier) Notify(ctx context.Context, msg string) error {
-	body, err := json.Marshal(map[string]string{w.field: truncate(msg, maxMessageLen)})
+func (w *webhookNotifier) Notify(ctx context.Context, alerts []Alert) error {
+	for _, payload := range w.payloads(alerts) {
+		if err := w.post(ctx, payload); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *webhookNotifier) payloads(alerts []Alert) []any {
+	var out []any
+	if w.flavour == flavourSlack {
+		texts := make([]string, len(alerts))
+		for i, a := range alerts {
+			texts[i] = a.slackText(w.loc)
+		}
+		return append(out, map[string]string{"text": truncate(strings.Join(texts, "\n\n"), maxSlackText)})
+	}
+	for start := 0; start < len(alerts); start += maxEmbedsPerPost {
+		end := min(start+maxEmbedsPerPost, len(alerts))
+		embeds := make([]discordEmbed, 0, end-start)
+		for _, a := range alerts[start:end] {
+			embeds = append(embeds, a.discordEmbed())
+		}
+		out = append(out, map[string]any{"embeds": embeds})
+	}
+	return out
+}
+
+func (w *webhookNotifier) post(ctx context.Context, payload any) error {
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return err
 	}

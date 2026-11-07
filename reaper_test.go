@@ -174,13 +174,22 @@ type harness struct {
 }
 
 type fakeNotifier struct {
-	msgs []string
-	err  error
+	batches [][]Alert
+	err     error
 }
 
-func (n *fakeNotifier) Notify(_ context.Context, msg string) error {
-	n.msgs = append(n.msgs, msg)
+func (n *fakeNotifier) Notify(_ context.Context, alerts []Alert) error {
+	n.batches = append(n.batches, alerts)
 	return n.err
+}
+
+func (h *harness) lastAlert() Alert {
+	h.t.Helper()
+	if len(h.notifier.batches) == 0 {
+		h.t.Fatal("no alerts sent")
+	}
+	b := h.notifier.batches[len(h.notifier.batches)-1]
+	return b[len(b)-1]
 }
 
 // events drains recorded events.
@@ -271,14 +280,18 @@ func TestRemediatePodsFilters(t *testing.T) {
 	if got := testutil.ToFloat64(h.reaper.metrics.reaped.WithLabelValues("default", "ReplicaSet/bad-rs", "CrashLoopBackOff")); got != 1 {
 		t.Fatalf("reaped_total = %v, want 1", got)
 	}
-	if len(h.notifier.msgs) != 1 || !strings.Contains(h.notifier.msgs[0], "pod-reaper: reaped default/bad (ReplicaSet/bad-rs): container=app") {
-		t.Fatalf("notifications = %q", h.notifier.msgs)
+	if len(h.notifier.batches) != 1 || len(h.notifier.batches[0]) != 1 {
+		t.Fatalf("notifications = %+v", h.notifier.batches)
+	}
+	if a := h.notifier.batches[0][0]; a.Kind != AlertReaped || a.Namespace != "default" || a.Pod != "bad" ||
+		a.Workload != "ReplicaSet/bad-rs" || a.Finding.Container != "app" || a.Count24h != 1 {
+		t.Fatalf("alert = %+v", a)
 	}
 
 	// Nothing eligible: no further events or notifications.
 	h.scan(time.Minute)
-	if len(h.events()) != 0 || len(h.notifier.msgs) != 1 {
-		t.Fatalf("unexpected follow-up events/notifications: %q", h.notifier.msgs)
+	if len(h.events()) != 0 || len(h.notifier.batches) != 1 {
+		t.Fatalf("unexpected follow-up events/notifications: %+v", h.notifier.batches)
 	}
 }
 
@@ -305,9 +318,8 @@ func TestRemediatePodsCooldown(t *testing.T) {
 	if got := testutil.ToFloat64(h.reaper.metrics.skipped.WithLabelValues("cooldown")); got != 1 {
 		t.Fatalf("skipped{cooldown} = %v, want 1 (logged once per window)", got)
 	}
-	last := h.notifier.msgs[len(h.notifier.msgs)-1]
-	if !strings.Contains(last, "ReplicaSet/app-rs reaped 2 times in the last 24h") {
-		t.Fatalf("expected repeat-offender note, got %q", last)
+	if last := h.lastAlert(); last.Workload != "ReplicaSet/app-rs" || last.Count24h != 2 {
+		t.Fatalf("expected repeat-offender count 2, got %+v", last)
 	}
 }
 
@@ -316,8 +328,8 @@ func TestHistoryWindow(t *testing.T) {
 	h.scan(0)
 	h.add(newPod("default", "a2", crashing, ownedBy("app-rs")))
 	h.scan(25 * time.Hour) // first reap has aged out of the 24h window
-	if last := h.notifier.msgs[len(h.notifier.msgs)-1]; strings.Contains(last, "times in the last 24h") {
-		t.Fatalf("stale history counted: %q", last)
+	if last := h.lastAlert(); last.Count24h != 1 {
+		t.Fatalf("stale history counted: %+v", last)
 	}
 }
 
@@ -378,13 +390,15 @@ func TestRemediatePodsRateLimit(t *testing.T) {
 	h.expectPods()
 
 	var limitNotes int
-	for _, m := range h.notifier.msgs {
-		if strings.Contains(m, "hourly limit of 2 reaps reached") {
-			limitNotes++
+	for _, b := range h.notifier.batches {
+		for _, a := range b {
+			if a.Kind == AlertRateLimited && a.MaxPerHr == 2 {
+				limitNotes++
+			}
 		}
 	}
 	if limitNotes != 1 {
-		t.Fatalf("expected one rate-limit notification, got %d in %q", limitNotes, h.notifier.msgs)
+		t.Fatalf("expected one rate-limit alert, got %d in %+v", limitNotes, h.notifier.batches)
 	}
 }
 
@@ -399,8 +413,8 @@ func TestRemediatePodsDryRun(t *testing.T) {
 	if len(h.events()) != 0 {
 		t.Fatal("dry-run should not emit events")
 	}
-	if len(h.notifier.msgs) == 0 || !strings.HasPrefix(h.notifier.msgs[0], "pod-reaper [dry-run]: would reap") {
-		t.Fatalf("notifications = %q", h.notifier.msgs)
+	if len(h.notifier.batches) == 0 || h.notifier.batches[0][0].Kind != AlertDryRun {
+		t.Fatalf("notifications = %+v", h.notifier.batches)
 	}
 	if len(h.reaper.lastReap) != 1 || len(h.reaper.reapTimes) != 1 {
 		t.Fatalf("dry-run should record would-be reaps: lastReap=%v reapTimes=%v", h.reaper.lastReap, h.reaper.reapTimes)

@@ -122,7 +122,7 @@ func (r *Reaper) remediatePods(ctx context.Context) error {
 
 	r.prune()
 
-	var notes []string
+	var alerts []Alert
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		f, ok := r.shouldRemediate(pod)
@@ -146,8 +146,7 @@ func (r *Reaper) remediatePods(ctx context.Context) error {
 			if !r.rateLogged {
 				log.Warn("skipping pod: hourly reap limit reached; pausing reaps until it clears",
 					"max_reaps_per_hour", r.cfg.MaxReapsPerHour)
-				notes = append(notes, fmt.Sprintf("pod-reaper: hourly limit of %d reaps reached; reaping is paused until it clears (next skipped: %s/%s).",
-					r.cfg.MaxReapsPerHour, pod.Namespace, pod.Name))
+				alerts = append(alerts, Alert{Kind: AlertRateLimited, Time: r.now(), Namespace: pod.Namespace, Pod: pod.Name, MaxPerHr: r.cfg.MaxReapsPerHour})
 				r.rateLogged = true
 				r.metrics.skipped.WithLabelValues("rate_limit").Inc()
 			}
@@ -157,7 +156,7 @@ func (r *Reaper) remediatePods(ctx context.Context) error {
 		if r.cfg.DryRun {
 			count := r.record(pod.Namespace, o)
 			log.Info("dry-run: would reap pod", "reaps_last_24h", count)
-			notes = append(notes, r.message(pod, o, f, true, count))
+			alerts = append(alerts, r.alert(AlertDryRun, pod, o, f, count))
 			continue
 		}
 
@@ -170,10 +169,10 @@ func (r *Reaper) remediatePods(ctx context.Context) error {
 		log.Info("reaped pod", "reaps_last_24h", count)
 		r.metrics.reaped.WithLabelValues(pod.Namespace, o.Workload, f.Reason).Inc()
 		r.emitEvents(pod, o, f)
-		notes = append(notes, r.message(pod, o, f, false, count))
+		alerts = append(alerts, r.alert(AlertReaped, pod, o, f, count))
 	}
 
-	r.notify(ctx, notes)
+	r.notify(ctx, alerts)
 	return nil
 }
 
@@ -237,26 +236,18 @@ func (r *Reaper) emitEvents(pod *v1.Pod, o owner, f finding) {
 	r.recorder.Eventf(ref, v1.EventTypeWarning, "ReapedPod", "pod-reaper deleted pod %s: %s", pod.Name, summary)
 }
 
-func (r *Reaper) message(pod *v1.Pod, o owner, f finding, dryRun bool, count int) string {
-	verb := "pod-reaper: reaped"
-	if dryRun {
-		verb = "pod-reaper [dry-run]: would reap"
-	}
-	s := fmt.Sprintf("%s %s/%s (%s): %s", verb, pod.Namespace, pod.Name, o.Workload, f.summary(r.cfg.Location))
-	if count > 1 {
-		s += fmt.Sprintf(" | %s reaped %d times in the last 24h", o.Workload, count)
-	}
-	return s
+func (r *Reaper) alert(kind AlertKind, pod *v1.Pod, o owner, f finding, count int) Alert {
+	return Alert{Kind: kind, Time: r.now(), Namespace: pod.Namespace, Pod: pod.Name, Workload: o.Workload, Finding: f, Count24h: count}
 }
 
-// notify sends this scan's messages as one webhook post.
-func (r *Reaper) notify(ctx context.Context, notes []string) {
-	if r.notifier == nil || len(notes) == 0 {
+// notify sends this scan's alerts in one batch.
+func (r *Reaper) notify(ctx context.Context, alerts []Alert) {
+	if r.notifier == nil || len(alerts) == 0 {
 		return
 	}
 	ctx, cancel := context.WithTimeout(ctx, notifyTimeout)
 	defer cancel()
-	if err := r.notifier.Notify(ctx, strings.Join(notes, "\n")); err != nil {
+	if err := r.notifier.Notify(ctx, alerts); err != nil {
 		r.logger.Error("webhook notification failed", "error", err)
 		r.metrics.notifyErrors.Inc()
 	}
