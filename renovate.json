@@ -1,0 +1,12 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "postUpdateOptions": ["gomodTidy"],
+  "packageRules": [
+    {
+      "description": "Keep k8s.io client libraries in lockstep",
+      "matchPackageNames": ["k8s.io/**"],
+      "groupName": "kubernetes client"
+    }
+  ]
+}
