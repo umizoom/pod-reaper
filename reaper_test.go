@@ -2,13 +2,21 @@ package main
 
 import (
 	"context"
+	"errors"
+	"io"
+	"log/slog"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/tools/record"
 )
 
 type podOpt func(*v1.Pod)
@@ -123,21 +131,69 @@ func TestShouldRemediate(t *testing.T) {
 	}
 }
 
-func TestOwnerKey(t *testing.T) {
+func TestOwnerOf(t *testing.T) {
 	p := newPod("media", "a", ownedBy("app-123"))
 	notController := false
 	p.OwnerReferences = append([]metav1.OwnerReference{{Kind: "Other", Name: "x", Controller: &notController}}, p.OwnerReferences...)
-	if got := ownerKey(p); got != "media/ReplicaSet/app-123" {
-		t.Fatalf("ownerKey() = %q", got)
+	if o := ownerOf(p); o.Key != "media/ReplicaSet/app-123" || o.Workload != "ReplicaSet/app-123" {
+		t.Fatalf("ownerOf() = %+v", o)
+	}
+
+	p = newPod("media", "unpackerr-9ccf76887-x", ownedBy("unpackerr-9ccf76887"))
+	p.Labels = map[string]string{"pod-template-hash": "9ccf76887"}
+	if o := ownerOf(p); o.Key != "media/ReplicaSet/unpackerr-9ccf76887" || o.Workload != "Deployment/unpackerr" {
+		t.Fatalf("ownerOf() = %+v", o)
+	}
+}
+
+func TestFindingTerminationInfo(t *testing.T) {
+	finished := time.Date(2026, 10, 26, 9, 14, 39, 0, time.UTC)
+	p := newPod("default", "a", crashing, func(p *v1.Pod) {
+		p.Status.ContainerStatuses[0].LastTerminationState.Terminated = &v1.ContainerStateTerminated{
+			ExitCode: 137, Reason: "OOMKilled", FinishedAt: metav1.NewTime(finished),
+		}
+	})
+	f, ok := NewReaper(nil, testConfig()).shouldRemediate(p)
+	if !ok || f.LastExitCode == nil || *f.LastExitCode != 137 || f.LastTermReason != "OOMKilled" || !f.LastFinishedAt.Equal(finished) {
+		t.Fatalf("finding = %+v", f)
+	}
+	want := "container=app reason=CrashLoopBackOff restarts=5 last_exit=137 (OOMKilled) at 2026-10-26 09:14:39 UTC"
+	if got := f.summary(time.UTC); got != want {
+		t.Fatalf("summary() = %q, want %q", got, want)
 	}
 }
 
 // harness runs remediation scans against a fake clientset with a fake clock.
 type harness struct {
-	t      *testing.T
-	client *fake.Clientset
-	reaper *Reaper
-	clock  time.Time
+	t        *testing.T
+	client   *fake.Clientset
+	reaper   *Reaper
+	clock    time.Time
+	recorder *record.FakeRecorder
+	notifier *fakeNotifier
+}
+
+type fakeNotifier struct {
+	msgs []string
+	err  error
+}
+
+func (n *fakeNotifier) Notify(_ context.Context, msg string) error {
+	n.msgs = append(n.msgs, msg)
+	return n.err
+}
+
+// events drains recorded events.
+func (h *harness) events() []string {
+	var out []string
+	for {
+		select {
+		case e := <-h.recorder.Events:
+			out = append(out, e)
+		default:
+			return out
+		}
+	}
 }
 
 func newHarness(t *testing.T, cfg Config, pods ...*v1.Pod) *harness {
@@ -145,8 +201,13 @@ func newHarness(t *testing.T, cfg Config, pods ...*v1.Pod) *harness {
 	for _, p := range pods {
 		h.add(p)
 	}
+	h.recorder = record.NewFakeRecorder(100)
+	h.notifier = &fakeNotifier{}
 	h.reaper = NewReaper(h.client, cfg)
 	h.reaper.now = func() time.Time { return h.clock }
+	h.reaper.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	h.reaper.recorder = h.recorder
+	h.reaper.notifier = h.notifier
 	return h
 }
 
@@ -200,6 +261,25 @@ func TestRemediatePodsFilters(t *testing.T) {
 	)
 	h.scan(0)
 	h.expectPods("default/good", "default/young", "default/bare", "kube-system/system")
+
+	events := h.events()
+	if len(events) != 2 ||
+		!strings.HasPrefix(events[0], "Warning Reaped Deleted by pod-reaper: container=app reason=CrashLoopBackOff restarts=5") ||
+		!strings.HasPrefix(events[1], "Warning ReapedPod pod-reaper deleted pod bad:") {
+		t.Fatalf("events = %q", events)
+	}
+	if got := testutil.ToFloat64(h.reaper.metrics.reaped.WithLabelValues("default", "ReplicaSet/bad-rs", "CrashLoopBackOff")); got != 1 {
+		t.Fatalf("reaped_total = %v, want 1", got)
+	}
+	if len(h.notifier.msgs) != 1 || !strings.Contains(h.notifier.msgs[0], "pod-reaper: reaped default/bad (ReplicaSet/bad-rs): container=app") {
+		t.Fatalf("notifications = %q", h.notifier.msgs)
+	}
+
+	// Nothing eligible: no further events or notifications.
+	h.scan(time.Minute)
+	if len(h.events()) != 0 || len(h.notifier.msgs) != 1 {
+		t.Fatalf("unexpected follow-up events/notifications: %q", h.notifier.msgs)
+	}
 }
 
 func TestRemediatePodsCooldown(t *testing.T) {
@@ -221,6 +301,50 @@ func TestRemediatePodsCooldown(t *testing.T) {
 
 	h.scan(time.Minute) // cooldown elapsed
 	h.expectPods()
+
+	if got := testutil.ToFloat64(h.reaper.metrics.skipped.WithLabelValues("cooldown")); got != 1 {
+		t.Fatalf("skipped{cooldown} = %v, want 1 (logged once per window)", got)
+	}
+	last := h.notifier.msgs[len(h.notifier.msgs)-1]
+	if !strings.Contains(last, "ReplicaSet/app-rs reaped 2 times in the last 24h") {
+		t.Fatalf("expected repeat-offender note, got %q", last)
+	}
+}
+
+func TestHistoryWindow(t *testing.T) {
+	h := newHarness(t, testConfig(), newPod("default", "a1", crashing, ownedBy("app-rs")))
+	h.scan(0)
+	h.add(newPod("default", "a2", crashing, ownedBy("app-rs")))
+	h.scan(25 * time.Hour) // first reap has aged out of the 24h window
+	if last := h.notifier.msgs[len(h.notifier.msgs)-1]; strings.Contains(last, "times in the last 24h") {
+		t.Fatalf("stale history counted: %q", last)
+	}
+}
+
+func TestNotifyFailureCounted(t *testing.T) {
+	h := newHarness(t, testConfig(), newPod("default", "a", crashing))
+	h.notifier.err = errors.New("boom")
+	h.scan(0)
+	h.expectPods()
+	if got := testutil.ToFloat64(h.reaper.metrics.notifyErrors); got != 1 {
+		t.Fatalf("notify_errors_total = %v, want 1", got)
+	}
+}
+
+func TestScanErrorCounted(t *testing.T) {
+	h := newHarness(t, testConfig())
+	h.client.PrependReactor("list", "pods", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, errors.New("api down")
+	})
+	if err := h.reaper.remediatePods(context.Background()); err == nil {
+		t.Fatal("expected error")
+	}
+	if got := testutil.ToFloat64(h.reaper.metrics.scanErrors); got != 1 {
+		t.Fatalf("scan_errors_total = %v, want 1", got)
+	}
+	if h.reaper.metrics.lastCompleted.Load() == 0 {
+		t.Fatal("failed scans should still count as completed for liveness")
+	}
 }
 
 func TestRemediatePodsCooldownDisabled(t *testing.T) {
@@ -252,6 +376,16 @@ func TestRemediatePodsRateLimit(t *testing.T) {
 	}
 	h.scan(time.Minute) // first reaps age out of the window
 	h.expectPods()
+
+	var limitNotes int
+	for _, m := range h.notifier.msgs {
+		if strings.Contains(m, "hourly limit of 2 reaps reached") {
+			limitNotes++
+		}
+	}
+	if limitNotes != 1 {
+		t.Fatalf("expected one rate-limit notification, got %d in %q", limitNotes, h.notifier.msgs)
+	}
 }
 
 func TestRemediatePodsDryRun(t *testing.T) {
@@ -262,6 +396,12 @@ func TestRemediatePodsDryRun(t *testing.T) {
 	h.scan(0)
 	h.scan(time.Second)
 	h.expectPods("default/a", "default/b")
+	if len(h.events()) != 0 {
+		t.Fatal("dry-run should not emit events")
+	}
+	if len(h.notifier.msgs) == 0 || !strings.HasPrefix(h.notifier.msgs[0], "pod-reaper [dry-run]: would reap") {
+		t.Fatalf("notifications = %q", h.notifier.msgs)
+	}
 	if len(h.reaper.lastReap) != 1 || len(h.reaper.reapTimes) != 1 {
 		t.Fatalf("dry-run should record would-be reaps: lastReap=%v reapTimes=%v", h.reaper.lastReap, h.reaper.reapTimes)
 	}
@@ -277,6 +417,9 @@ func TestLoadConfig(t *testing.T) {
 	}
 	if !cfg.DryRun || cfg.Interval != 30*time.Second || len(cfg.IncludeNamespaces) != 2 || !cfg.ExcludeNamespaces["kube-system"] {
 		t.Fatalf("unexpected config: %+v", cfg)
+	}
+	if cfg.LogFormat != "text" || !cfg.Events || cfg.MetricsAddr != ":8080" || cfg.WebhookURL != "" {
+		t.Fatalf("unexpected visibility defaults: %+v", cfg)
 	}
 	if cfg.MinRestarts != 3 || cfg.Cooldown != 10*time.Minute || cfg.MaxReapsPerHour != 20 ||
 		len(cfg.Reasons) != 2 || !cfg.Reasons["CrashLoopBackOff"] || !cfg.Reasons["CreateContainerError"] {
@@ -306,6 +449,8 @@ func TestLoadConfig(t *testing.T) {
 		"COOLDOWN":           "-5m",
 		"POLL_INTERVAL":      "0",
 		"REASONS":            " , ",
+		"LOG_FORMAT":         "xml",
+		"EVENTS":             "maybe",
 	} {
 		t.Run(key, func(t *testing.T) {
 			t.Setenv(key, bad)
