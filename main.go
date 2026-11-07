@@ -40,9 +40,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	reaper := &Reaper{client: clientset, cfg: cfg}
-	reaper.log("Starting Pod Reaper controller (dry-run=%t, interval=%s, include=%v, exclude=%v)...",
-		cfg.DryRun, cfg.Interval, keys(cfg.IncludeNamespaces), keys(cfg.ExcludeNamespaces))
+	reaper := NewReaper(clientset, cfg)
+	reaper.log("Starting Pod Reaper controller (dry-run=%t, interval=%s, include=%v, exclude=%v, reasons=%v, min-restarts=%d, cooldown=%s, max-reaps-per-hour=%d)...",
+		cfg.DryRun, cfg.Interval, keys(cfg.IncludeNamespaces), keys(cfg.ExcludeNamespaces),
+		keys(cfg.Reasons), cfg.MinRestarts, cfg.Cooldown, cfg.MaxReapsPerHour)
 
 	wait.UntilWithContext(ctx, func(ctx context.Context) {
 		if err := reaper.remediatePods(ctx); err != nil && ctx.Err() == nil {

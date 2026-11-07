@@ -10,16 +10,39 @@ import (
 	"k8s.io/client-go/kubernetes"
 )
 
-// remediationReasons are container waiting reasons that trigger a pod delete.
-var remediationReasons = map[string]bool{
-	"CreateContainerError": true,
-	"CrashLoopBackOff":     true,
+// finding describes why a pod qualifies for remediation.
+type finding struct {
+	Container string
+	Reason    string
+	Restarts  int32
+}
+
+func (f finding) String() string {
+	return fmt.Sprintf("container=%s reason=%s restarts=%d", f.Container, f.Reason, f.Restarts)
 }
 
 // Reaper deletes pods stuck in a bad container state.
+//
+// Cooldown and rate-limit state is kept in memory and resets on restart.
 type Reaper struct {
 	client kubernetes.Interface
 	cfg    Config
+	now    func() time.Time
+
+	lastReap       map[string]time.Time // owner key -> last reap time
+	cooldownLogged map[string]bool      // owner key -> skip already logged this window
+	reapTimes      []time.Time          // reaps within the last hour
+	rateLogged     bool                 // rate-limit hit already logged
+}
+
+func NewReaper(client kubernetes.Interface, cfg Config) *Reaper {
+	return &Reaper{
+		client:         client,
+		cfg:            cfg,
+		now:            time.Now,
+		lastReap:       map[string]time.Time{},
+		cooldownLogged: map[string]bool{},
+	}
 }
 
 func (r *Reaper) remediatePods(ctx context.Context) error {
@@ -28,40 +51,99 @@ func (r *Reaper) remediatePods(ctx context.Context) error {
 		return err
 	}
 
-	for _, pod := range podList.Items {
-		reason, ok := r.shouldRemediate(&pod)
+	r.prune()
+
+	for i := range podList.Items {
+		pod := &podList.Items[i]
+		f, ok := r.shouldRemediate(pod)
 		if !ok {
+			continue
+		}
+		name := pod.Namespace + "/" + pod.Name
+		owner := ownerKey(pod)
+
+		if last, ok := r.lastReap[owner]; ok {
+			if !r.cooldownLogged[owner] {
+				r.log("Skipping pod %s (%s): owner %s reaped %s ago, cooldown %s",
+					name, f, owner, r.now().Sub(last).Round(time.Second), r.cfg.Cooldown)
+				r.cooldownLogged[owner] = true
+			}
+			continue
+		}
+
+		if r.cfg.MaxReapsPerHour > 0 && len(r.reapTimes) >= r.cfg.MaxReapsPerHour {
+			if !r.rateLogged {
+				r.log("Rate limit reached (%d reaps in the last hour); skipping pod %s (%s) and others until it clears",
+					r.cfg.MaxReapsPerHour, name, f)
+				r.rateLogged = true
+			}
 			continue
 		}
 
 		if r.cfg.DryRun {
-			r.log("[dry-run] Would remediate pod %s/%s (%s)", pod.Namespace, pod.Name, reason)
+			r.log("[dry-run] Would remediate pod %s (%s)", name, f)
+			r.record(owner)
 			continue
 		}
 
-		r.log("Remediating pod %s/%s (%s)...", pod.Namespace, pod.Name, reason)
-		err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{})
-		if err != nil {
-			r.log("Failed to delete pod %s/%s: %v", pod.Namespace, pod.Name, err)
-		} else {
-			r.log("Pod %s/%s deleted successfully.", pod.Namespace, pod.Name)
+		r.log("Remediating pod %s (%s)...", name, f)
+		if err := r.client.CoreV1().Pods(pod.Namespace).Delete(ctx, pod.Name, metav1.DeleteOptions{}); err != nil {
+			r.log("Failed to delete pod %s: %v", name, err)
+			continue
 		}
+		r.log("Pod %s deleted successfully.", name)
+		r.record(owner)
 	}
 
 	return nil
 }
 
-// shouldRemediate reports whether the pod should be deleted and why.
-func (r *Reaper) shouldRemediate(pod *v1.Pod) (string, bool) {
-	if !r.inScope(pod) {
-		return "", false
+func (r *Reaper) record(owner string) {
+	now := r.now()
+	if r.cfg.Cooldown > 0 {
+		r.lastReap[owner] = now
 	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if w := cs.State.Waiting; w != nil && remediationReasons[w.Reason] {
-			return w.Reason, true
+	r.reapTimes = append(r.reapTimes, now)
+}
+
+// prune drops expired cooldown entries and reaps older than an hour.
+func (r *Reaper) prune() {
+	now := r.now()
+	for owner, t := range r.lastReap {
+		if now.Sub(t) >= r.cfg.Cooldown {
+			delete(r.lastReap, owner)
+			delete(r.cooldownLogged, owner)
 		}
 	}
-	return "", false
+	kept := r.reapTimes[:0]
+	for _, t := range r.reapTimes {
+		if now.Sub(t) < time.Hour {
+			kept = append(kept, t)
+		}
+	}
+	r.reapTimes = kept
+	if r.cfg.MaxReapsPerHour == 0 || len(r.reapTimes) < r.cfg.MaxReapsPerHour {
+		r.rateLogged = false
+	}
+}
+
+// shouldRemediate reports whether the pod should be deleted and why.
+func (r *Reaper) shouldRemediate(pod *v1.Pod) (finding, bool) {
+	if !r.inScope(pod) {
+		return finding{}, false
+	}
+	statuses := append(append([]v1.ContainerStatus{}, pod.Status.InitContainerStatuses...), pod.Status.ContainerStatuses...)
+	for _, cs := range statuses {
+		w := cs.State.Waiting
+		if w == nil || !r.cfg.Reasons[w.Reason] {
+			continue
+		}
+		if w.Reason == ReasonCrashLoopBackOff && cs.RestartCount < r.cfg.MinRestarts {
+			continue
+		}
+		return finding{Container: cs.Name, Reason: w.Reason, Restarts: cs.RestartCount}, true
+	}
+	return finding{}, false
 }
 
 // inScope filters out pods that must never be deleted by the reaper.
@@ -83,6 +165,16 @@ func (r *Reaper) inScope(pod *v1.Pod) bool {
 		return false
 	}
 	return true
+}
+
+// ownerKey identifies the controller that owns the pod, e.g.
+// "media/ReplicaSet/unpackerr-9ccf76887". Pods reach here only with owners.
+func ownerKey(pod *v1.Pod) string {
+	ref := pod.OwnerReferences[0]
+	if c := metav1.GetControllerOfNoCopy(pod); c != nil {
+		ref = *c
+	}
+	return pod.Namespace + "/" + ref.Kind + "/" + ref.Name
 }
 
 func (r *Reaper) log(format string, args ...any) {
