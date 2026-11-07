@@ -1,33 +1,22 @@
-# Stage 1: Build the Go application
-FROM golang:1.22 AS builder
+# syntax=docker/dockerfile:1
 
-# Set the working directory inside the container
-WORKDIR /app
+# Build on the native platform and cross-compile for the target (no QEMU).
+FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
+ARG TARGETOS
+ARG TARGETARCH
+WORKDIR /src
 
-# Copy the Go modules manifests
 COPY go.mod go.sum ./
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 
-# Download dependencies
-RUN go mod download
+COPY *.go ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
+    go build -trimpath -ldflags="-s -w" -o /out/pod-reaper .
 
-# Copy the source code into the container
-COPY . .
-
-# Build the application
-RUN go build -o controller .
-
-# Stage 2: Create a minimal runtime image
-# FROM alpine:3.18
-
-# Install required certificates
-# RUN apk add --no-cache ca-certificates
-
-# Set the working directory
-# WORKDIR /app
-
-# Copy the compiled binary from the build stage
-# COPY --from=builder /app/controller .
-
-
-# Run the application
-CMD ["./controller"]
+# Minimal runtime: static binary, CA certs, tzdata, non-root user.
+FROM gcr.io/distroless/static-debian12:nonroot
+COPY --from=builder /out/pod-reaper /pod-reaper
+USER nonroot:nonroot
+ENTRYPOINT ["/pod-reaper"]

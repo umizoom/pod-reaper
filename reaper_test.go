@@ -110,7 +110,7 @@ func TestRemediatePods(t *testing.T) {
 	}
 
 	for _, dryRun := range []bool{false, true} {
-		client := fake.NewSimpleClientset()
+		client := fake.NewClientset()
 		for _, p := range pods {
 			if _, err := client.CoreV1().Pods(p.Namespace).Create(context.Background(), p, metav1.CreateOptions{}); err != nil {
 				t.Fatal(err)
