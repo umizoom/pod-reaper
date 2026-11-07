@@ -26,6 +26,10 @@ type Config struct {
 	MaxReapsPerHour   int // 0 means unlimited
 	Interval          time.Duration
 	Location          *time.Location
+	LogFormat         string // "text" or "json"
+	Events            bool   // emit Kubernetes Events for reaps
+	MetricsAddr       string // listen address for /metrics and /healthz; "" disables
+	WebhookURL        string // optional Discord/Slack webhook; never logged
 }
 
 func loadConfig() (Config, error) {
@@ -59,6 +63,16 @@ func loadConfig() (Config, error) {
 	if cfg.Interval, err = envDuration("POLL_INTERVAL", 10*time.Second, false); err != nil {
 		return cfg, err
 	}
+
+	cfg.LogFormat = envDefault("LOG_FORMAT", "text")
+	if cfg.LogFormat != "text" && cfg.LogFormat != "json" {
+		return cfg, fmt.Errorf("invalid LOG_FORMAT %q: must be text or json", cfg.LogFormat)
+	}
+	if cfg.Events, err = envBool("EVENTS", true); err != nil {
+		return cfg, err
+	}
+	cfg.MetricsAddr = envDefault("METRICS_ADDR", ":8080")
+	cfg.WebhookURL = os.Getenv("WEBHOOK_URL")
 
 	tz := os.Getenv("TIMEZONE")
 	if tz == "" {
